@@ -125,6 +125,39 @@ volume. It never removes the image (content-addressed tags are shared across run
 use `scripts/rl-env gc --prune-images`). Verified: reset -> deploy -> verify passes
 from a fresh volume, twice, with the same deterministic login.
 
+## Submodule deployment proof (2026-11-14)
+
+Verified from the fork-backed submodule at `apps/ackee`, not from the prospect
+checkout:
+
+```bash
+cd apps/ackee
+IMAGE_TAG=tester-env-ackee:fork-integrate ./tester-env deploy --run-id fork-integrate --port 8097
+./tester-env verify --run-id fork-integrate --port 8097   # exit 0
+./tester-env reset  --run-id fork-integrate
+IMAGE_TAG=tester-env-ackee:fork-integrate ./tester-env deploy --run-id fork-integrate --port 8097
+./tester-env verify --run-id fork-integrate --port 8097   # exit 0
+./tester-env reset  --run-id fork-integrate
+```
+
+- Build was fully cached (`npm ci` and `BUILD_ENV=pre` bundle layers) and named the
+  image `tester-env-ackee:fork-integrate`; the default instance's `:dev` tag was
+  not touched.
+- Each `deploy` started `tester-env-ackee-fork-integrate` plus
+  `tester-env-ackee-fork-integrate-mongo-1`, was healthy after 4s and seeded
+  `3 domains, 137 pageviews, 4 custom events, 39 actions, 1 permanent token`.
+- `verify` reported: 3 domains (Harbor Store, Northstar Docs, Northstar Journal);
+  viewsToday 14, averageViews 5/day (+50%), averageDuration 273.1s, viewsMonth 89,
+  viewsYear 137; 24h pages 14 across 11 URLs, 4 referrers, 7 systems, 8 devices,
+  7 browsers, 8 sizes, 5 languages; 7d 59 / 30d 104 / 6mo 137 pageviews; docs 7d
+  empty and 6mo 10; 14-day chart
+  `[14, 9, 7, 7, 7, 9, 6, 0, 5, 5, 5, 5, 5, 5, 0]`; checkout 7d
+  `[267, 59, 99, 149, 0, 89, 0]`; `Newsletter relay` permanent token.
+- Both reset cycles removed only `tester-env-ackee-fork-integrate`,
+  `tester-env-ackee-fork-integrate-mongo-1`, the run's mongo volume and compose
+  network. The default instance on port 8200 stayed at HTTP 200 throughout, and
+  shared browser infrastructure was untouched.
+
 ## Environment
 
 | Variable | Default | Purpose |
