@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Ackee - Tester Environment CLI
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+# Commands: deploy, seed, verify, reset, stop, logs, status, help
+#
+# Baseline: v3.7.1 (700437008481bdee1cffee62bb89ec906899cff0)
+
+RUN_ID="default"
+PORT="8200"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.tester-env.yml"
+
+# Deterministic single-admin credentials (Ackee has one admin account only).
+CREDENTIALS_USERNAME="${ACKEE_USERNAME:-admin}"
+CREDENTIALS_PASSWORD="${ACKEE_PASSWORD:-tester-env-admin}"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+
+    CONTAINER_NAME="tester-env-ackee${suffix}"
+    # IMAGE_TAG is set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-ackee:dev}"
+    COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-tester-env-ackee${suffix}}"
+}
+
+compose() {
+    docker compose \
+        -p "${COMPOSE_PROJECT}" \
+        -f "${COMPOSE_FILE}" \
+        --project-directory "${SCRIPT_DIR}" \
+        "$@"
+}
+
+compose_env() {
+    COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT}" \
+    CONTAINER_NAME="${CONTAINER_NAME}" \
+    IMAGE_TAG="${IMAGE_NAME}" \
+    PORT="${PORT}" \
+    ACKEE_USERNAME="${CREDENTIALS_USERNAME}" \
+    ACKEE_PASSWORD="${CREDENTIALS_PASSWORD}" \
+    compose "$@"
+}
+
+# Ackee answers / with the generated index.html and /api with GraphQL. Both are
+# required: the API probe also proves the Mongo connection-independent server
+# is up, and login verification (cmd_verify) proves the database connection.
+wait_for_health() {
+    local attempt
+    for attempt in $(seq 1 90); do
+        if curl -sf "http://localhost:${PORT}/" >/dev/null 2>&1 &&
+           curl -sf -X POST "http://localhost:${PORT}/api" \
+               -H 'Content-Type: application/json' \
+               -d '{"query":"{__typename}"}' >/dev/null 2>&1; then
+            echo "==> App healthy after ${attempt}s"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "Error: app did not become healthy at http://localhost:${PORT}/" >&2
+    compose_env logs --tail 80 >&2 || true
+    exit 1
+}
+
+cmd_deploy() {
+    echo "==> Building image from source: ${IMAGE_NAME}..."
+    echo "    (cold build installs devDependencies and compiles dist/index.js/.css from src)"
+    compose_env build
+
+    echo "==> Starting ${CONTAINER_NAME} + mongo on port ${PORT}..."
+    compose_env up -d --no-build
+
+    wait_for_health
+    cmd_seed --quiet
+
+    echo "==> Deployment complete."
+    echo "    URL:      http://localhost:${PORT}/"
+    echo "    Login:    ${CREDENTIALS_USERNAME} / ${CREDENTIALS_PASSWORD}"
+}
+
+require_running() {
+    if ! compose_env ps --status running --format '{{.Name}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"; then
+        echo "Error: container ${CONTAINER_NAME} is not running. Run './tester-env deploy' first." >&2
+        exit 1
+    fi
+}
+
+# Deterministic analytics fixtures. Ackee's createRecord mutation always uses
+# the current time, so historical pageviews are inserted straight into MongoDB
+# with fixed ids and timestamps relative to the seed run. See
+# tester-env-seed.js for the fixture set and offsets, and tester-env-verify.py
+# for the assertions. The seed replaces the fixture collections, so running it
+# twice (or after a reset) yields the same visible state.
+cmd_seed() {
+    local quiet="${1:-}"
+    require_running
+
+    [[ "${quiet}" == "--quiet" ]] || echo "==> Seeding deterministic analytics fixtures..."
+
+    local output summary
+    if ! output=$(compose_env exec -T mongo mongosh --quiet mongodb://localhost:27017/ackee \
+        --eval "$(cat "${SCRIPT_DIR}/tester-env-seed.js")" 2>&1); then
+        echo "Error: seeding failed" >&2
+        printf '%s\n' "${output}" >&2
+        exit 1
+    fi
+
+    summary=$(printf '%s\n' "${output}" | grep -E '^Seed OK:' | tail -1)
+    if [[ -z "${summary}" ]]; then
+        echo "Error: seeding produced no summary" >&2
+        printf '%s\n' "${output}" >&2
+        exit 1
+    fi
+
+    echo "    ${summary}"
+}
+
+# Proves the deterministic credentials, the database path and the seeded
+# fixture counts through the same authenticated GraphQL API the UI uses.
+cmd_verify() {
+    require_running
+    python3 "${SCRIPT_DIR}/tester-env-verify.py" \
+        --base-url "http://localhost:${PORT}" \
+        --username "${CREDENTIALS_USERNAME}" \
+        --password "${CREDENTIALS_PASSWORD}"
+}
+
+cmd_reset() {
+    echo "==> Resetting environment..."
+    compose_env down -v --remove-orphans || true
+    echo "==> Reset complete (app container, mongo container and the run's mongo volume removed)."
+}
+
+cmd_stop() {
+    echo "==> Stopping containers (mongo data preserved)..."
+    compose_env stop
+}
+
+cmd_logs() {
+    compose_env logs -f --tail 100 "$@"
+}
+
+cmd_status() {
+    if compose_env ps --status running --format '{{.Name}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"; then
+        # Prefer the actual published mapping: a later invocation without
+        # --port would otherwise report the default while the run uses another.
+        local url_port published
+        url_port="${PORT}"
+        published=$(compose_env port ackee 3000 2>/dev/null | awk -F: 'NF {print $NF}' | tail -1)
+        [[ -n "${published}" ]] && url_port="${published}"
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${url_port}/"
+        echo "Browser URL: ${TESTER_ENV_BROWSER_ORIGIN:-http://host.docker.internal:${url_port}/}"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Compose project: ${COMPOSE_PROJECT}"
+        echo "Image: ${IMAGE_NAME}"
+        echo "Credentials: ${CREDENTIALS_USERNAME} / ${CREDENTIALS_PASSWORD}"
+    else
+        echo "Status: NOT RUNNING"
+    fi
+}
+
+cmd_help() {
+    cat <<'EOF'
+Ackee - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build the image from source, start app + mongo, wait for health, seed
+  seed      Replace the fixture collections with the deterministic data set
+  verify    Assert login and fixture counts over the GraphQL API
+  reset     Remove the run's containers and mongo volume
+  stop      Stop containers (mongo data preserved)
+  logs      Tail container logs
+  status    Show container status, URL and credentials
+  help      Show this help message
+
+Options:
+  --run-id <id>   Isolate compose project/containers/volume for parallel runs. Default: default
+  --port <port>   Host port for the UI (container port 3000). Default: 8200
+
+Typical workflow:
+  ./tester-env deploy    # Build, start, seed, verify health
+  ./tester-env seed      # Recreate the deterministic fixtures (idempotent)
+  ./tester-env verify    # Check login and fixture counts
+  ./tester-env reset     # Clean slate
+
+Seed data (tester-env-seed.js):
+  - 3 websites: Northstar Journal (editorial), Harbor Store (shop),
+    Northstar Docs (older history only, no traffic in the last 7 days).
+  - 137 pageviews: 14 in the last 24 hours, 59 in 7 days, 104 in 30 days,
+    137 in 6 months, spread over 14 days of daily buckets and older history.
+  - Fixed visitors per website: macOS/Safari, Windows/Chrome, iOS, Android,
+    Ubuntu/Firefox, ... so systems, devices, browsers, sizes and languages
+    lists all have multiple stable entries.
+  - 4 custom events with 39 actions: Newsletter signup (list), Checkout
+    completed (chart), Reading time (average chart), Article rating
+    (average list).
+  - 1 permanent token: Newsletter relay.
+  - Timestamps are relative to the seed run: recent pageviews sit inside the
+    last 25 minutes, "yesterday" sits 25 hours back and older pageviews sit at
+    14:00 UTC of a calendar day N days ago. Facts that depend on the current
+    month/year (views this month/year) are therefore derived rather than fixed.
+
+Verification (tester-env-verify.py):
+  - Logs in with the deterministic credentials and queries the UI's GraphQL
+    API with Time-Zone: UTC, so daily buckets match the seed.
+  - Asserts domain titles, 24h/7d/30d/6mo page totals, per-domain lists,
+    referrers, systems/devices/browsers/sizes/languages, daily chart buckets,
+    event lists/charts, permanent token and the overview facts.
+
+Deployment details:
+  - Baseline: v3.7.1 (700437008481bdee1cffee62bb89ec906899cff0)
+  - Dockerfile.tester-env keeps devDependencies (npm ci --include=dev) and
+    compiles dist/index.js/.css from src via BUILD_ENV=pre, because upstream
+    ships committed bundles and its production install omits react/rosid.
+    A src-only mutation re-runs just the COPY src + bundle build; `npm ci` is
+    cached in its own layer.
+  - MongoDB is pinned to mongo:7 and its data lives in a compose-named volume
+    scoped by the compose project, so reset (`down -v`) drops it.
+  - NODE_ENV=production; dist/index.html is regenerated from the container env
+    on every start (npm start), so env changes need a restart, not a rebuild.
+
+Environment:
+  IMAGE_TAG        Content-addressed image tag exported by scripts/rl-env
+  ACKEE_USERNAME   Deterministic admin username. Default: admin
+  ACKEE_PASSWORD   Deterministic admin password. Default: tester-env-admin
+
+Caveats:
+  - One admin credential only; there is no multi-user surface.
+  - All statistics are relative-date aggregates (24h/7d/30d/6mo), so fixtures
+    must use offsets from seed time (see `./tester-env seed` above).
+  - Requests carrying the ackee_ignore=1 cookie are dropped by the tracker API;
+    a logged-in browser sets that cookie, which is expected.
+  - Active visitors (the Live badge) only counts pageviews updated within the
+    last 30 seconds, so it reads 0 unless the browser opens right after seeding.
+  - verify queries with Time-Zone: UTC. Seeded times sit between 09:00 and
+    15:00 UTC, so daily buckets match for any client timezone from UTC-8 to
+    UTC+7 (the browser container is CET).
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --run-id)
+                RUN_ID="${2:?--run-id requires a value}"
+                shift 2
+                ;;
+            --port)
+                PORT="${2:?--port requires a value}"
+                shift 2
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                cmd_help
+                exit 1
+                ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            echo "Unknown command: ${cmd}" >&2
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

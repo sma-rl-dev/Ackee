@@ -1,0 +1,50 @@
+# tester-env compose stack for Ackee: the source-built app plus MongoDB.
+#
+# The tester-env CLI is the supported entry point; it supplies IMAGE_TAG, PORT,
+# CONTAINER_NAME, COMPOSE_PROJECT_NAME and the deterministic credentials.
+# Direct `docker compose up --build` also works with the defaults below on
+# port 8200.
+#
+# Upstream's docker-compose.yml pairs electerious/ackee (a prebuilt image) with
+# a floating `mongo` tag and a ./data bind mount. This overlay builds the app
+# from this checkout and pins mongo:7 (Ackee 3.7.1 uses Mongoose 9, which
+# supports MongoDB 4.4+; mongo:7 is a driver-compatible server line).
+
+name: ${COMPOSE_PROJECT_NAME:-tester-env-ackee}
+
+services:
+  ackee:
+    build:
+      context: .
+      dockerfile: Dockerfile.tester-env
+    image: ${IMAGE_TAG:-tester-env-ackee:dev}
+    container_name: ${CONTAINER_NAME:-tester-env-ackee}
+    ports:
+      - "${PORT:-8200}:3000"
+    environment:
+      ACKEE_MONGODB: mongodb://mongo:27017/ackee
+      ACKEE_USERNAME: ${ACKEE_USERNAME:-admin}
+      ACKEE_PASSWORD: ${ACKEE_PASSWORD:-tester-env-admin}
+      ACKEE_TTL: "86400000"
+      NODE_ENV: production
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    # No host port: only the app container talks to MongoDB.
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.adminCommand(\"ping\").ok' | grep -q 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    volumes:
+      # Compose namespaces this volume by COMPOSE_PROJECT_NAME, so each RUN_ID
+      # gets its own database and `down -v` drops exactly that run's data.
+      - mongo-data:/data/db
+
+volumes:
+  mongo-data:

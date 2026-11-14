@@ -1,0 +1,50 @@
+# Editable-source image for Ackee (tester-env).
+#
+# Upstream's Dockerfile runs `npm ci` with NODE_ENV=production, so npm omits
+# devDependencies, and it ships the committed dist/index.js + dist/index.css.
+# UI-source mutations therefore could not be rebuilt in the stock image:
+# rosid-handler-js-next, rosid-handler-css and react all live in
+# devDependencies.
+#
+# This variant installs with --include=dev and compiles the UI bundles from
+# src at image build time (BUILD_ENV=pre, which is the only mode that writes
+# dist/index.js and dist/index.css). Layer order keeps `npm ci` cached across
+# source-only mutations, so a source edit only re-runs COPY src + the ~10s
+# bundle build instead of the dependency install.
+#
+# The runtime still runs `npm start` (= `npm run build && npm run server`).
+# That non-pre build only regenerates dist/index.html from the container env
+# (demo mode / custom tracker), so it stays fast and does not clobber the
+# bundles compiled here.
+
+FROM node:24-alpine
+
+WORKDIR /srv/app
+
+# Production runtime mode; --include=dev overrides npm's NODE_ENV=production
+# default for the dependency install so the UI can be rebuilt.
+ENV NODE_ENV=production
+
+# Own /srv/app (and a real HOME for the npm cache) as the runtime user up
+# front: npm ci and the bundle build then write node_modules/dist as ackee, so
+# no slow recursive chown is needed.
+RUN adduser -D ackee && mkdir -p /home/ackee && chown -R ackee:ackee /home/ackee /srv/app
+USER ackee
+
+COPY --chown=ackee:ackee package.json package-lock.json ./
+RUN npm ci --include=dev
+
+COPY --chown=ackee:ackee build.js ./
+COPY --chown=ackee:ackee src ./src
+COPY --chown=ackee:ackee dist ./dist
+
+# Compile dist/index.js, dist/index.css and dist/tracker.js from src. Minified
+# because NODE_ENV is production; use BUILD_ENV=pre NODE_ENV=development for
+# readable bundles when debugging a UI mutation.
+RUN BUILD_ENV=pre npm run build
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=1m --timeout=45s --start-period=45s CMD [ "npm", "run", "healthcheck" ]
+
+CMD [ "npm", "start" ]
